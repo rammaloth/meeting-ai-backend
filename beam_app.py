@@ -1,23 +1,22 @@
-from beam import Image, QueueDepthAutoscaler, asgi
+from beam import Image, asgi
 
 
 @asgi(
     name="meeting-ai-stt-deepgram",
-    cpu=0.25,
-    memory="512Mi",
+    cpu=1.0,
+    memory=1024,
     image=Image(
         python_version="python3.11",
-        python_packages=["fastapi", "websockets"],
+        python_packages=[
+            "fastapi==0.115.12",
+            "websockets==15.0.1",
+        ],
     ),
     secrets=["DEEPGRAM_API_KEY"],
     authorized=False,
-    keep_warm_seconds=60,
-    concurrent_requests=20,
-    autoscaler=QueueDepthAutoscaler(
-        min_containers=0,
-        max_containers=1,
-        tasks_per_container=20,
-    ),
+    keep_warm_seconds=10,
+    concurrent_requests=5,
+    timeout=-1,
 )
 def web_server(context):
     from server import app
