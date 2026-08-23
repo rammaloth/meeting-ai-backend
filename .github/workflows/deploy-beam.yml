@@ -1,0 +1,25 @@
+name: Deploy Meeting AI STT to Beam
+
+on:
+  workflow_dispatch:
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install Beam CLI
+        run: pip install beam-client==0.2.207
+
+      - name: Configure Beam
+        run: beam configure default --token "${{ secrets.BEAM_TOKEN }}"
+
+      - name: Deploy native ASGI service
+        run: beam deploy beam_app.py:web_server
