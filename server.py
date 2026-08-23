@@ -1,84 +1,111 @@
 import asyncio
-from contextlib import asynccontextmanager
+import json
+import os
+from urllib.parse import urlencode
 
-import numpy as np
-import torch
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
-from transformers import pipeline
+from websockets.asyncio.client import connect
 
 SAMPLE_RATE = 16000
-WINDOW_SECONDS = 1.0
-STEP_SECONDS = 0.8
-WINDOW_BYTES = int(SAMPLE_RATE * WINDOW_SECONDS) * 2
-STEP_BYTES = int(SAMPLE_RATE * STEP_SECONDS) * 2
+DEEPGRAM_URL = "wss://api.deepgram.com/v1/listen?" + urlencode(
+    {
+        "model": "nova-3",
+        "language": "en",
+        "encoding": "linear16",
+        "sample_rate": SAMPLE_RATE,
+        "channels": 1,
+        "interim_results": "true",
+        "smart_format": "true",
+        "punctuate": "true",
+        "endpointing": 300,
+        "utterance_end_ms": 1000,
+        "vad_events": "true",
+    }
+)
 
-speech_pipe = None
-inference_lock = asyncio.Lock()
-
-
-@asynccontextmanager
-async def lifespan(app: FastAPI):
-    global speech_pipe
-    speech_pipe = pipeline(
-        "automatic-speech-recognition",
-        model="nvidia/parakeet-tdt-0.6b-v3",
-        device="cuda",
-        dtype=torch.float16,
-    )
-    yield
-
-
-app = FastAPI(title="Meeting AI Low-Latency STT", lifespan=lifespan)
+app = FastAPI(title="Meeting AI Streaming STT")
 
 
 @app.get("/health")
 async def health():
     return {
         "status": "ok",
-        "service": "meeting-ai-stt-low-latency",
-        "model": "nvidia/parakeet-tdt-0.6b-v3",
-        "gpu": "A10G",
-        "window_seconds": WINDOW_SECONDS,
-        "step_seconds": STEP_SECONDS,
+        "service": "meeting-ai-streaming-stt",
+        "provider": "deepgram",
+        "model": "nova-3",
+        "streaming": True,
+        "api_key_configured": bool(os.getenv("DEEPGRAM_API_KEY")),
     }
 
 
-def decode_pcm16(audio_bytes: bytes):
-    pcm = np.frombuffer(audio_bytes, dtype=np.int16)
-    return np.nan_to_num(pcm.astype(np.float32) / 32768.0)
-
-
-def transcribe(audio):
-    result = speech_pipe({"raw": audio, "sampling_rate": SAMPLE_RATE})
-    return result.get("text", "").strip()
-
-
 @app.websocket("/ws")
-async def websocket_endpoint(ws: WebSocket):
-    await ws.accept()
-    await ws.send_json({
-        "type": "connected",
-        "message": "Low-latency STT ready",
-        "model": "nvidia/parakeet-tdt-0.6b-v3",
-    })
-    pcm_buffer = bytearray()
+async def websocket_endpoint(client: WebSocket):
+    await client.accept()
+    api_key = os.getenv("DEEPGRAM_API_KEY")
+    if not api_key:
+        await client.send_json({"type": "error", "message": "STT service is not configured"})
+        await client.close(code=1011)
+        return
+
     try:
-        while True:
-            pcm_buffer.extend(await ws.receive_bytes())
-            while len(pcm_buffer) >= WINDOW_BYTES:
-                audio = decode_pcm16(bytes(pcm_buffer[:WINDOW_BYTES]))
-                del pcm_buffer[:STEP_BYTES]
+        async with connect(
+            DEEPGRAM_URL,
+            additional_headers={"Authorization": f"Token {api_key}"},
+            ping_interval=20,
+            ping_timeout=20,
+            max_size=None,
+        ) as deepgram:
+            await client.send_json(
+                {"type": "connected", "message": "Streaming STT ready", "model": "nova-3"}
+            )
+
+            async def forward_audio():
                 try:
-                    async with inference_lock:
-                        text = await asyncio.to_thread(transcribe, audio)
-                    await ws.send_json({
-                        "type": "transcript",
-                        "text": text,
-                        "window_seconds": WINDOW_SECONDS,
-                        "step_seconds": STEP_SECONDS,
-                    })
-                except Exception as exc:
-                    await ws.send_json({"type": "error", "message": str(exc)})
+                    while True:
+                        await deepgram.send(await client.receive_bytes())
+                except WebSocketDisconnect:
+                    try:
+                        await deepgram.send(json.dumps({"type": "CloseStream"}))
+                    except Exception:
+                        pass
+
+            async def forward_transcripts():
+                async for raw_message in deepgram:
+                    message = json.loads(raw_message)
+                    if message.get("type") != "Results":
+                        continue
+                    alternatives = message.get("channel", {}).get("alternatives", [])
+                    if not alternatives:
+                        continue
+                    transcript = alternatives[0].get("transcript", "").strip()
+                    if not transcript:
+                        continue
+                    await client.send_json(
+                        {
+                            "type": "transcript",
+                            "text": transcript,
+                            "is_final": bool(message.get("is_final")),
+                            "speech_final": bool(message.get("speech_final")),
+                            "start": message.get("start"),
+                            "duration": message.get("duration"),
+                        }
+                    )
+
+            audio_task = asyncio.create_task(forward_audio())
+            transcript_task = asyncio.create_task(forward_transcripts())
+            done, pending = await asyncio.wait(
+                {audio_task, transcript_task}, return_when=asyncio.FIRST_COMPLETED
+            )
+            for task in pending:
+                task.cancel()
+            await asyncio.gather(*pending, return_exceptions=True)
+            for task in done:
+                if not task.cancelled():
+                    task.result()
     except WebSocketDisconnect:
         pass
-
+    except Exception as exc:
+        try:
+            await client.send_json({"type": "error", "message": str(exc)})
+        except Exception:
+            pass
