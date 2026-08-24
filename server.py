@@ -20,6 +20,7 @@ DEEPGRAM_URL = "wss://api.deepgram.com/v1/listen?" + urlencode(
         "endpointing": 300,
         "utterance_end_ms": 1000,
         "vad_events": "true",
+        "diarize": "true",
     }
 )
 
@@ -80,6 +81,11 @@ async def websocket_endpoint(client: WebSocket):
                     transcript = alternatives[0].get("transcript", "").strip()
                     if not transcript:
                         continue
+                    words = alternatives[0].get("words", [])
+                    speaker = next(
+                        (word.get("speaker") for word in words if word.get("speaker") is not None),
+                        None,
+                    )
                     await client.send_json(
                         {
                             "type": "transcript",
@@ -88,6 +94,7 @@ async def websocket_endpoint(client: WebSocket):
                             "speech_final": bool(message.get("speech_final")),
                             "start": message.get("start"),
                             "duration": message.get("duration"),
+                            "speaker": speaker,
                         }
                     )
 
