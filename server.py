@@ -82,21 +82,30 @@ async def websocket_endpoint(client: WebSocket):
                     if not transcript:
                         continue
                     words = alternatives[0].get("words", [])
-                    speaker = next(
-                        (word.get("speaker") for word in words if word.get("speaker") is not None),
-                        None,
-                    )
-                    await client.send_json(
-                        {
-                            "type": "transcript",
-                            "text": transcript,
-                            "is_final": bool(message.get("is_final")),
-                            "speech_final": bool(message.get("speech_final")),
-                            "start": message.get("start"),
-                            "duration": message.get("duration"),
-                            "speaker": speaker,
-                        }
-                    )
+                    segments = []
+                    for word in words:
+                        speaker = word.get("speaker")
+                        token = word.get("punctuated_word") or word.get("word", "")
+                        if not token:
+                            continue
+                        if not segments or segments[-1]["speaker"] != speaker:
+                            segments.append({"speaker": speaker, "words": [token]})
+                        else:
+                            segments[-1]["words"].append(token)
+                    if not segments:
+                        segments = [{"speaker": None, "words": [transcript]}]
+                    for segment in segments:
+                        await client.send_json(
+                            {
+                                "type": "transcript",
+                                "text": " ".join(segment["words"]),
+                                "is_final": bool(message.get("is_final")),
+                                "speech_final": bool(message.get("speech_final")),
+                                "start": message.get("start"),
+                                "duration": message.get("duration"),
+                                "speaker": segment["speaker"],
+                            }
+                        )
 
             audio_task = asyncio.create_task(forward_audio())
             transcript_task = asyncio.create_task(forward_transcripts())
